@@ -1,0 +1,8 @@
+- name: Alice Mentor
+  hours: 2
+  availability: [9, 10]
+  sort: 10
+- name: Bob Mentor
+  hours: 1
+  availability: [9]
+  sort: 10
