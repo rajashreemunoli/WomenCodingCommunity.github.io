@@ -2,37 +2,42 @@
 """
 adhoc_mentorlink_autoclose: close a mentor's ad-hoc link when monthly capacity is reached.
 
-Logic, each run:
-  1) Load current month’s responses from Google Sheet (or LOCAL_CSV for offline test).
-  2) Keep only FIRST application per mentee (earliest timestamp) for the current month.
-  3) Count applications per mentor.
-  4) For any mentor with count >= hours AND current month in availability:
-       - remove current month from `availability`
+Process (each run):
+  1) Load current month responses (Google Sheet or LOCAL_CSV fixture).
+  2) Keep only FIRST application per mentee (earliest timestamp) for the month.
+  3) Count applications per mentor (by normalized name).
+  4) For any mentor with count >= hours AND current month present in `availability`:
+       - remove the current month from availability
        - set `sort: 100`
-  5) Write `_data/mentors.yml` (PR will be opened by workflow).
+     Write those changes back to mentors.yml using SURGICAL, TEXT-ONLY PATCHES
+     to preserve all other formatting and indentation exactly.
 
 ENV:
-  - GCP_SA_KEY_FILE: path to SA JSON (workflow writes to $RUNNER_TEMP/sa.json)
-  - SHEET_ID: Google Sheet ID (number in URL between `/d/` and `/edit`)
+  - GCP_SA_KEY_FILE: path to SA JSON (required unless LOCAL_CSV set)
+  - SHEET_ID: Google Sheet ID (required unless LOCAL_CSV set)
   - SHEET_WORKSHEET_TITLE: sheet tab (default: "Form Responses 1")
+  - LOCAL_CSV: path to fixture CSV (columns: timestamp, mentee_name, mentor_name, email)
   - MENTORS_YML_PATH: path to mentors.yml (default: "_data/mentors.yml")
   - TIMEZONE: IANA TZ (default: "Europe/London")
   - DRY_RUN: "1" = log only, no write
-  - LOCAL_CSV: path to fixture CSV (skips Google calls; columns: timestamp, mentee_name, mentor_name, email)
 """
 
-import os, io, sys, logging
+import io
+import os
+import re
+import sys
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dateutil.relativedelta import relativedelta
 from dateutil import parser as dateparser
 import pandas as pd
-from ruamel.yaml import YAML
 from unidecode import unidecode
+from ruamel.yaml import YAML  # only used for READ (to find mentors safely)
 
 LOCAL_CSV = os.getenv("LOCAL_CSV")
 if not LOCAL_CSV:
-    import gspread
+    import gspread  # only needed for live Sheet access
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -50,6 +55,7 @@ if not LOCAL_CSV:
             logging.error(f"Missing env var: {var}")
             sys.exit(1)
 
+# ---------- Helpers ----------
 def normalize_text(s: str) -> str:
     if s is None:
         return ""
@@ -108,6 +114,7 @@ def as_int_list(value):
     return [iv] if iv is not None else []
 
 def find_header(header_row, candidates):
+    """Return the original header text from header_row that contains any of `candidates` (normalized, substring)."""
     normalized_headers = [normalize_text(h) for h in header_row]
     for i, h in enumerate(normalized_headers):
         if any(c in h for c in candidates):
@@ -154,6 +161,7 @@ else:
     if not rows:
         logging.info("No responses found.")
         sys.exit(0)
+    # Keep only the needed columns; rename to normalized names
     df = pd.DataFrame(rows)[[col_ts, col_mentee, col_mentor, col_email]]
     df.columns = ["timestamp", "mentee_name", "mentor_name", "email"]
 
@@ -182,21 +190,178 @@ logging.info("Counts per mentor (first apps only):")
 for k, v in counts.items():
     logging.info(f"  {k!r}: {v}")
 
-# ---------- Update mentors.yml ----------
+# ---------- Text-patch utilities (preserve formatting) ----------
+def line_ending(s: str) -> str:
+    if s.endswith("\r\n"):
+        return "\r\n"
+    if s.endswith("\r"):
+        return "\r"
+    return "\n"
+
+def build_mentor_blocks(lines):
+    """
+    Return {normalized_name: (start_idx, end_idx, indent_str, original_name)} for each mentor block.
+    A mentor block starts at a line like:    <indent>- name: Some Name
+    and ends right before the next "- name:" or EOF.
+    """
+    pat = re.compile(r'^(\s*)-\s*name:\s*(.+?)\s*$', re.UNICODE)
+    starts = []
+    for i, line in enumerate(lines):
+        m = pat.match(line)
+        if m:
+            starts.append((i, m.group(1), m.group(2).strip()))
+    blocks = {}
+    for idx, (start, indent, name) in enumerate(starts):
+        end = starts[idx + 1][0] if idx + 1 < len(starts) else len(lines)
+        blocks[normalize_name(name)] = (start, end, indent, name)
+    return blocks
+
+def patch_availability_and_sort_in_block(lines, start, end, current_month):
+    """
+    Within lines[start:end], update:
+      - availability: remove current_month (handles inline [..] or block list below)
+      - sort: set to 100 (insert if missing)
+    Returns True if any change was made.
+    """
+    changed = False
+
+    # availability header
+    avail_hdr_re = re.compile(r'^(\s*)availability:\s*(.*?)(\s*(#.*))?$', re.IGNORECASE)
+    avail_hdr_idx = None
+    avail_hdr_indent = ""
+    avail_rest = ""
+    avail_comment = ""
+    avail_hdr_nl = "\n"
+
+    for i in range(start, end):
+        m = avail_hdr_re.match(lines[i])
+        if m:
+            avail_hdr_idx = i
+            avail_hdr_indent = m.group(1) or ""
+            avail_rest = (m.group(2) or "").strip()
+            avail_comment = (m.group(3) or "")
+            avail_hdr_nl = line_ending(lines[i])
+            break
+
+    if avail_hdr_idx is not None:
+        # case A: inline flow style, e.g. "availability: [9, 10]"
+        if "[" in avail_rest and "]" in avail_rest:
+            nums = [int(x) for x in re.findall(r'\d+', avail_rest)]
+            new_nums = [n for n in nums if n != current_month]
+            new_rest = "[]"
+            if new_nums:
+                new_rest = "[" + ", ".join(str(n) for n in new_nums) + "]"
+            new_line = f"{avail_hdr_indent}availability: {new_rest}{avail_comment}{avail_hdr_nl}"
+            if lines[avail_hdr_idx] != new_line:
+                lines[avail_hdr_idx] = new_line
+                changed = True
+        else:
+            # case B: block style list after header
+            item_indent = avail_hdr_indent + "  "
+            j = avail_hdr_idx + 1
+            items_idx = []
+            item_nl = "\n"
+            while j < end:
+                m = re.match(rf'^({re.escape(item_indent)})-\s*(\d+)\s*([#].*)?$', lines[j])
+                if not m:
+                    break
+                items_idx.append(j)
+                item_nl = line_ending(lines[j])
+                j += 1
+            if items_idx:
+                nums = []
+                for k in items_idx:
+                    m = re.match(rf'^{re.escape(item_indent)}-\s*(\d+)\s*([#].*)?$', lines[k])
+                    if m:
+                        nums.append(int(m.group(1)))
+                new_nums = [n for n in nums if n != current_month]
+
+                if len(new_nums) != len(nums):
+                    changed = True
+                    if not new_nums:
+                        # collapse to inline empty list
+                        lines[avail_hdr_idx] = f"{avail_hdr_indent}availability: []{avail_comment}{avail_hdr_nl}"
+                        # remove the old list lines
+                        for k in reversed(items_idx):
+                            del lines[k]
+                            end -= 1
+                    else:
+                        # remove old items
+                        for k in reversed(items_idx):
+                            del lines[k]
+                            end -= 1
+                        # insert new items
+                        insert_at = avail_hdr_idx + 1
+                        for n in new_nums:
+                            lines.insert(insert_at, f"{item_indent}- {n}{item_nl}")
+                            insert_at += 1
+
+    # sort: set to 100 (insert if missing)
+    sort_re = re.compile(r'^(\s*)sort:\s*(\d+)\s*(#.*)?$')
+    sort_idx = None
+    sort_indent = None
+    sort_nl = "\n"
+    for i in range(start, end):
+        m = sort_re.match(lines[i])
+        if m:
+            sort_idx = i
+            sort_indent = m.group(1) or ""
+            sort_nl = line_ending(lines[i])
+            current = int(m.group(2))
+            if current != 100:
+                lines[i] = f"{sort_indent}sort: 100{sort_nl}"
+                changed = True
+            break
+
+    if sort_idx is None:
+        # insert sort after availability (if present), else at end of block
+        target_nl = avail_hdr_nl if avail_hdr_idx is not None else "\n"
+        insert_indent = (avail_hdr_indent if avail_hdr_idx is not None else "  ")
+        insert_at = end
+        if avail_hdr_idx is not None:
+            insert_at = avail_hdr_idx + 1
+            # skip any availability item lines to place sort after them
+            while insert_at < len(lines) and re.match(r'^\s*-\s*\d+\s*$', lines[insert_at].strip()):
+                insert_at += 1
+        lines.insert(insert_at, f"{insert_indent}sort: 100{target_nl}")
+        changed = True
+
+    return changed
+
+def apply_text_patches(path, names_to_update, current_month):
+    """
+    names_to_update: iterable of *display* names (exact as in file, any case/accents).
+    Returns list of names actually changed.
+    """
+    # Read preserving original per-line newline endings
+    with io.open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    lines = text.splitlines(True)  # keep line endings
+
+    blocks = build_mentor_blocks(lines)
+    changed_names = []
+
+    for display_name in names_to_update:
+        key = normalize_name(display_name)
+        if key not in blocks:
+            logging.warning(f"Mentor not found in YAML (text mode): {display_name!r}")
+            continue
+        start, end, indent, orig_name = blocks[key]
+        if patch_availability_and_sort_in_block(lines, start, end, current_month):
+            changed_names.append(orig_name)
+
+    if changed_names and not DRY_RUN:
+        with io.open(path, "w", encoding="utf-8") as f:
+            f.write("".join(lines))
+
+    return changed_names
+
+# ---------- Decide who to update (YAML read only) ----------
 yaml = YAML()
-yaml.preserve_quotes = True
-yaml.default_flow_style = False
-# Ensure top-level sequence items ( - name: … ) are flush-left and valid
-yaml.indent(mapping=2, sequence=2, offset=0)
-
-
 with io.open(MENTORS_YML_PATH, "r", encoding="utf-8") as f:
     data = yaml.load(f)
 
-mentors = data
-if isinstance(data, dict):
-    mentors = data.get("mentors") or data.get("items") or []
-
+mentors = data if isinstance(data, list) else (data.get("mentors") or data.get("items") or [])
 def mentor_display_name(item):
     for key in ("name", "full_name", "mentor", "title"):
         if key in item and item[key]:
@@ -207,45 +372,43 @@ def mentor_display_name(item):
         return f"{first} {last}".strip()
     return ""
 
-mentor_by_norm = {}
+# Map normalized -> display name as it appears in file
+display_by_norm = {}
 for m in mentors:
     nm = normalize_name(mentor_display_name(m))
     if nm:
-        mentor_by_norm[nm] = m
+        display_by_norm[nm] = mentor_display_name(m)
 
-modified = False
-changed = []
-
+to_update = []
 for mentor_norm, applied_count in counts.items():
-    if mentor_norm not in mentor_by_norm:
+    disp = display_by_norm.get(mentor_norm)
+    if not disp:
         logging.warning(f"Mentor from sheet not found in mentors.yml: {mentor_norm!r}")
         continue
-    mitem = mentor_by_norm[mentor_norm]
+    # find that mentor item to read hours & availability
+    mitem = next((m for m in mentors if normalize_name(mentor_display_name(m)) == mentor_norm), None)
+    if mitem is None:
+        continue
     hours = ensure_int(mitem.get("hours"))
     if hours is None:
-        logging.warning(f"Mentor {mentor_norm!r} has non-integer 'hours' ({mitem.get('hours')!r}); skipping.")
+        logging.warning(f"Mentor {disp!r} has non-integer 'hours' ({mitem.get('hours')!r}); skipping.")
         continue
     avail_list = as_int_list(mitem.get("availability"))
     is_current_available = current_month_num in avail_list
-
     if applied_count >= hours and is_current_available:
-        logging.info(f"Capacity reached for {mentor_norm!r} (count={applied_count}, hours={hours}); updating YAML.")
-        mitem["availability"] = [x for x in avail_list if x != current_month_num]
-        mitem["sort"] = 100
-        modified = True
-        changed.append(mentor_display_name(mitem))
-    else:
-        logging.info(f"No change for {mentor_norm!r} (count={applied_count}, hours={hours}, month_available={is_current_available})")
+        to_update.append(disp)
+        logging.info(f"Capacity reached for {disp!r} (count={applied_count}, hours={hours}); will patch.")
 
-if not modified:
+if not to_update:
     logging.info("No changes required. Exiting.")
     sys.exit(0)
 
 if DRY_RUN:
-    logging.info("[DRY_RUN] Would write changes, but DRY_RUN=1; exiting.")
+    logging.info("[DRY_RUN] Would patch mentors.yml for: %s", ", ".join(to_update))
     sys.exit(0)
 
-with io.open(MENTORS_YML_PATH, "w", encoding="utf-8") as f:
-    yaml.dump(data, f)
-
-logging.info("Updated mentors.yml. Changed mentors: %s", ", ".join(changed))
+changed_names = apply_text_patches(MENTORS_YML_PATH, to_update, current_month_num)
+if changed_names:
+    logging.info("Patched mentors.yml (text mode). Changed mentors: %s", ", ".join(changed_names))
+else:
+    logging.info("No text changes were applied (unexpected).")
