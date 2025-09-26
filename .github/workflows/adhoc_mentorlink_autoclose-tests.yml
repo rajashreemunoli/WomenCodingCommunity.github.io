@@ -1,0 +1,26 @@
+name: adhoc_mentorlink_autoclose – tests
+
+on:
+  pull_request:
+    paths:
+      - "tools/adhoc_mentorlink_autoclose/**"
+  workflow_dispatch: {}
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tools/adhoc_mentorlink_autoclose/requirements.txt
+
+      # Call with bash so you don't need chmod +x on Windows
+      - name: Run fixture test
+        run: bash tools/adhoc_mentorlink_autoclose/tests/test-auto-close-mentors.sh
