@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-Women Coding Community - Mentor capacity automation
+adhoc_mentorlink_autoclose: close a mentor's ad-hoc link when monthly capacity is reached.
 
-Runs on every new Google Form response (or manually/cron).
-Logic:
-  1) Load current month’s responses.
-  2) Keep only the FIRST application per mentee (earliest timestamp) for the month.
+Logic, each run:
+  1) Load current month’s responses from Google Sheet (or LOCAL_CSV for offline test).
+  2) Keep only FIRST application per mentee (earliest timestamp) for the current month.
   3) Count applications per mentor.
-  4) Load `_data/mentors.yml`. For any mentor where count >= hours AND current month is in `availability`:
-       - remove current month number from `availability`
+  4) For any mentor with count >= hours AND current month in availability:
+       - remove current month from `availability`
        - set `sort: 100`
-  5) Save file; GitHub Action will open a PR.
+  5) Write `_data/mentors.yml` (PR will be opened by workflow).
 
-Environment variables:
-  - GCP_SA_KEY_FILE: path to service account JSON (created by workflow or local)
-  - SHEET_ID: Google Sheet ID
-  - SHEET_WORKSHEET_TITLE: worksheet/tab (default: "Form Responses 1")
+ENV:
+  - GCP_SA_KEY_FILE: path to SA JSON (workflow writes to $RUNNER_TEMP/sa.json)
+  - SHEET_ID: Google Sheet ID (number in URL between `/d/` and `/edit`)
+  - SHEET_WORKSHEET_TITLE: sheet tab (default: "Form Responses 1")
   - MENTORS_YML_PATH: path to mentors.yml (default: "_data/mentors.yml")
-  - TIMEZONE: IANA timezone (default: "Europe/London")
-  - DRY_RUN: "1" to log only, no writes (default "0")
-  - LOCAL_CSV: path to local CSV fixture for offline tests (skips Google)
-    (columns required: timestamp, mentee_name, mentor_name, email)
+  - TIMEZONE: IANA TZ (default: "Europe/London")
+  - DRY_RUN: "1" = log only, no write
+  - LOCAL_CSV: path to fixture CSV (skips Google calls; columns: timestamp, mentee_name, mentor_name, email)
 """
 
 import os, io, sys, logging
@@ -116,7 +114,7 @@ def find_header(header_row, candidates):
             return header_row[i]
     return None
 
-# ---------- Load responses into DataFrame ----------
+# ---------- Load responses ----------
 tz = ZoneInfo(TZ)
 start, end, current_month_num = current_month_bounds(tz)
 
@@ -128,7 +126,7 @@ if LOCAL_CSV:
     if not required.issubset(set(df.columns)):
         logging.error(f"Fixture CSV must contain columns: {sorted(required)}")
         sys.exit(1)
-    df = df[["timestamp","mentee_name","mentor_name","email"]]
+    df = df[["timestamp", "mentee_name", "mentor_name", "email"]]
 else:
     logging.info("Authorizing gspread...")
     gc = gspread.service_account(filename=SA_FILE)
@@ -143,10 +141,10 @@ else:
     if not header:
         logging.info("No header row found. Exiting.")
         sys.exit(0)
-    col_ts = find_header(header, ["timestamp"])
+    col_ts     = find_header(header, ["timestamp"])
     col_mentee = find_header(header, ["what is your full name", "mentee name"])
     col_mentor = find_header(header, ["mentor's name", "mentor name"])
-    col_email = find_header(header, ["what is your email address", "email"])
+    col_email  = find_header(header, ["what is your email address", "email"])
     needed = [("Timestamp", col_ts), ("Mentee Name", col_mentee), ("Mentor Name", col_mentor), ("Email", col_email)]
     missing = [n for n, c in needed if c is None]
     if missing:
@@ -159,7 +157,7 @@ else:
     df = pd.DataFrame(rows)[[col_ts, col_mentee, col_mentor, col_email]]
     df.columns = ["timestamp", "mentee_name", "mentor_name", "email"]
 
-# Parse timestamps, filter to current month
+# timestamps & month filter
 df["ts_parsed"] = df["timestamp"].apply(lambda x: parse_timestamp(x, tz))
 df = df[df["ts_parsed"].notna()].copy()
 df = df[(df["ts_parsed"] >= start) & (df["ts_parsed"] < end)].copy()
@@ -167,35 +165,34 @@ if df.empty:
     logging.info("No responses for the current month. Nothing to do.")
     sys.exit(0)
 
-# Dedupe: only first application per mentee in the month
-df["email_norm"] = df["email"].apply(normalize_text)
+# first application per mentee (by earliest)
+df["email_norm"]  = df["email"].apply(normalize_text)
 df["mentee_norm"] = df["mentee_name"].apply(normalize_name)
-df["dedupe_key"] = df.apply(
-    lambda r: r["email_norm"] if r["email_norm"] else f"name::{r['mentee_norm']}", axis=1
-)
+df["dedupe_key"]  = df.apply(lambda r: r["email_norm"] if r["email_norm"] else f"name::{r['mentee_norm']}", axis=1)
 df = df.sort_values("ts_parsed", ascending=True).drop_duplicates(subset=["dedupe_key"], keep="first")
 
-# Count applications per mentor
+# counts per mentor
 df["mentor_norm"] = df["mentor_name"].apply(normalize_name)
 counts = df.groupby("mentor_norm").size().to_dict()
 if not counts:
     logging.info("After dedupe, there are no valid applications. Nothing to do.")
     sys.exit(0)
 
-logging.info("Counts per mentor (first applications only):")
+logging.info("Counts per mentor (first apps only):")
 for k, v in counts.items():
     logging.info(f"  {k!r}: {v}")
 
-# ---------- Load & update mentors.yml ----------
+# ---------- Update mentors.yml ----------
 yaml = YAML()
-yaml.preserve_quotes = True  # keep original quoting
-yaml.width = 4096
-yaml.indent(mapping=2, sequence=2, offset=2)
+yaml.preserve_quotes = True
+yaml.default_flow_style = False
+# Ensure top-level sequence items ( - name: … ) are flush-left and valid
+yaml.indent(mapping=2, sequence=2, offset=0)
+
 
 with io.open(MENTORS_YML_PATH, "r", encoding="utf-8") as f:
     data = yaml.load(f)
 
-# Handle top-level list or mapping-with-list
 mentors = data
 if isinstance(data, dict):
     mentors = data.get("mentors") or data.get("items") or []
@@ -228,7 +225,6 @@ for mentor_norm, applied_count in counts.items():
     if hours is None:
         logging.warning(f"Mentor {mentor_norm!r} has non-integer 'hours' ({mitem.get('hours')!r}); skipping.")
         continue
-
     avail_list = as_int_list(mitem.get("availability"))
     is_current_available = current_month_num in avail_list
 

@@ -8,7 +8,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 cp "$FIXDIR/mentors.input.yml" "$TMPDIR/mentors.yml"
 
-TIMEZONE="Europe/Paris" \
+TIMEZONE="Europe/London" \
 LOCAL_CSV="$FIXDIR/responses.csv" \
 MENTORS_YML_PATH="$TMPDIR/mentors.yml" \
 DRY_RUN="0" \
