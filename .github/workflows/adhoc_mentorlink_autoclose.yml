@@ -9,7 +9,7 @@ on:
   # Your script itself uses Europe/London for date logic.
   schedule:
   # Run on the 1st–10th of each month at 09:00 UTC
-    - cron: "30 9 1-10 * *"
+    - cron: "0 9 1-10 * *"
   # Run on the 1st–10th of each month at 18:00 UTC
     - cron: "0 18 1-10 * *"
 
