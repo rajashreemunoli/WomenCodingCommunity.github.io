@@ -1,0 +1,85 @@
+name: adhoc_mentorlink_autoclose – availability
+
+on:
+  repository_dispatch:
+    # Apps Script will send exactly this type
+    types: [adhoc-mentorlink-autoclose-submit]
+  workflow_dispatch: {}
+  # Daily run (GitHub cron is UTC; this fires at 07:30 UTC every day)
+  # Your script itself uses Europe/London for date logic.
+  schedule:
+  # Run on the 1st–10th of each month at 09:00 UTC
+    - cron: "0 9 1-10 * *"
+  # Run on the 1st–10th of each month at 18:00 UTC
+    - cron: "0 18 1-10 * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: adhoc_mentorlink_autoclose
+  cancel-in-progress: false
+
+jobs:
+  run-adhoc_mentorlink_autoclose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.ref || 'feat/adhoc-mentorlink-autoclose' }}
+      
+      - name: Debug which ref we checked out
+        run: |
+          echo "Checked out ref: ${{ github.event.client_payload.ref || 'feat/adhoc-mentorlink-autoclose' }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tools/adhoc_mentorlink_autoclose/requirements.txt
+
+      - name: Write Google service account key
+        env:
+          # Your secret name (as you set it)
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY_ADHOCMENTORLINKAUTOCLOSE }}
+        run: |
+          echo "$GCP_SA_KEY" > "$RUNNER_TEMP/sa.json"
+
+      - name: Run automation script
+        env:
+          GCP_SA_KEY_FILE: ${{ runner.TEMP }}/sa.json
+          SHEET_ID: ${{ vars.SHEET_ID }}
+          SHEET_WORKSHEET_TITLE: ${{ vars.SHEET_WORKSHEET_TITLE }}
+          MENTORS_YML_PATH: _data/mentors.yml
+          # London timezone for month filtering & logging
+          TIMEZONE: Europe/London
+          DRY_RUN: "0"
+        run: |
+          python tools/adhoc_mentorlink_autoclose/auto_close_mentors.py
+
+      - name: Create Pull Request
+        if: ${{ always() }}
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "adhoc_mentorlink_autoclose: disable ad-hoc mentors"
+          title: "adhoc_mentorlink_autoclose: capacity reached – run ${{ github.run_id }}"
+          body: |
+            Automation: adhoc_mentorlink_autoclose
+            Trigger: `${{ github.event_name }}` (type: `${{ github.event.action }}`)
+            Timezone: Europe/London
+            Sheet ID: `${{ vars.SHEET_ID }}`
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          add-paths: |
+            _data/mentors.yml
+
+      - name: Print PR link (if any)
+        if: ${{ steps.cpr.outputs.pull-request-url }}
+        run: |
+          echo "Pull Request URL: ${{ steps.cpr.outputs.pull-request-url }}"
