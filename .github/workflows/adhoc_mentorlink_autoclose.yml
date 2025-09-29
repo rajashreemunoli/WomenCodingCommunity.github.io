@@ -1,12 +1,16 @@
 name: adhoc_mentorlink_autoclose – availability
 
+# Triggers:
+# - manual workflow_dispatch (always allowed so you can test)
+# - repository_dispatch (Apps Script dispatch) — only runs if ENABLE_DISPATCH variable is 1
+# - schedule (cron) — only runs if ENABLE_CRON variable is 1
 on:
   repository_dispatch:
     types: [adhoc-mentorlink-autoclose-submit]
   workflow_dispatch:
     inputs:
       write:
-        description: "Write mode for this manual run"
+        description: "Write mode for manual run"
         type: choice
         required: true
         default: dry
@@ -16,9 +20,11 @@ on:
         required: false
         default: feat/adhoc-mentorlink-autoclose
   schedule:
-    - cron: "0 9 1-10 * *"   # days 1–10 at 09:00 UTC
-    - cron: "0 18 1-10 * *"  # days 1–10 at 18:00 UTC
+    # Runs on day 1–10 at 09:00 and 18:00 UTC (adjustable)
+    - cron: "0 9 1-10 * *"
+    - cron: "0 18 1-10 * *"
 
+# minimal rights needed
 permissions:
   contents: write
   pull-requests: write
@@ -29,16 +35,22 @@ concurrency:
 
 jobs:
   run-adhoc_mentorlink_autoclose:
-    # Manual is always allowed. Cron/dispatch require toggles.
+    # Job-level guard:
+    # - Allow manual runs always (workflow_dispatch)
+    # - For scheduled runs, require ENABLE_CRON == '1' (repo variable)
+    # - For dispatch runs, require ENABLE_DISPATCH == '1' (repo variable)
     if: ${{ github.event_name == 'workflow_dispatch'
            || (github.event_name == 'schedule' && vars.ENABLE_CRON == '1')
            || (github.event_name == 'repository_dispatch' && vars.ENABLE_DISPATCH == '1') }}
 
     runs-on: ubuntu-latest
+
     steps:
+      # --------- determine which git ref to checkout (supports dispatch payload or manual input) ----------
       - name: Resolve ref to checkout
         id: ref
         run: |
+          # Priority: repository_dispatch.client_payload.ref -> workflow_dispatch input.ref -> default
           if [ -n "${{ github.event.client_payload.ref }}" ]; then
             echo "value=${{ github.event.client_payload.ref }}" >> "$GITHUB_OUTPUT"
           elif [ -n "${{ inputs.ref }}" ]; then
@@ -47,11 +59,13 @@ jobs:
             echo "value=feat/adhoc-mentorlink-autoclose" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout repo (feature branch when provided)
+      # ----------------- checkout the repo (feature branch when provided) ------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.ref.outputs.value }}
 
+      # ----------------- debug print of toggles & chosen ref (helpful while testing) -------------------
       - name: Debug toggles & ref
         run: |
           echo "Event: ${{ github.event_name }}"
@@ -59,8 +73,10 @@ jobs:
           echo "ENABLE_CRON=${{ vars.ENABLE_CRON }}"
           echo "ENABLE_DISPATCH=${{ vars.ENABLE_DISPATCH }}"
           echo "ENABLE_WRITE=${{ vars.ENABLE_WRITE }}"
+          # for manual runs show chosen input
           echo "Manual write input=${{ inputs.write || 'n/a' }}"
 
+      # ----------------- setup python environment ------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -71,14 +87,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r tools/adhoc_mentorlink_autoclose/requirements.txt
 
+      # ----------------- write service account JSON to runner temp (from repo secret) -----------------
       - name: Write Google service account key
         env:
+          # secret should hold the entire SA JSON
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY_ADHOCMENTORLINKAUTOCLOSE }}
         run: |
+          # write the JSON into runner temp for the Python script to use
           echo "$GCP_SA_KEY" > "$RUNNER_TEMP/sa.json"
 
+      # ----------------- compute DRY_RUN and export via GITHUB_ENV (robust) ---------------------------
       - name: Resolve DRY_RUN
+        id: resolve_dry
         run: |
+          # For manual runs: respect inputs.write (live -> DRY_RUN=0, dry -> DRY_RUN=1)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             if [ "${{ inputs.write }}" = "live" ]; then
               echo "DRY_RUN=0" >> "$GITHUB_ENV"
@@ -86,29 +108,57 @@ jobs:
               echo "DRY_RUN=1" >> "$GITHUB_ENV"
             fi
           else
+            # For dispatch/cron runs, use the repo variable ENABLE_WRITE (1 -> write)
             if [ "${{ vars.ENABLE_WRITE }}" = "1" ]; then
               echo "DRY_RUN=0" >> "$GITHUB_ENV"
             else
               echo "DRY_RUN=1" >> "$GITHUB_ENV"
             fi
           fi
-          echo "Effective DRY_RUN=$(grep '^DRY_RUN=' $GITHUB_ENV | tail -n1 | cut -d= -f2)"
 
+          # For logs:
+          echo "Resolved DRY_RUN=$(grep '^DRY_RUN=' $GITHUB_ENV | tail -n1 | cut -d= -f2)"
+
+      # ----------------- run the Python automation (reads sheet, may write mentors.yml) ---------------
+      # Note: DRY_RUN is available in environment via GITHUB_ENV.
       - name: Run automation script
         env:
-          GCP_SA_KEY_FILE: ${{ runner.TEMP }}/sa.json
+          # path to the SA file we wrote above (Python script expects this)
+          GCP_SA_KEY_FILE: ${{ runner.temp }}/sa.json
           SHEET_ID: ${{ vars.SHEET_ID }}
           SHEET_WORKSHEET_TITLE: ${{ vars.SHEET_WORKSHEET_TITLE }}
           MENTORS_YML_PATH: _data/mentors.yml
           TIMEZONE: Europe/London
+          # DRY_RUN will be read from environment (set by previous step into GITHUB_ENV)
         run: |
+          echo "Effective DRY_RUN=$DRY_RUN"
           python tools/adhoc_mentorlink_autoclose/auto_close_mentors.py
 
+      # ----------------- detect whether repository files were changed by the script -----------------
+      # We check for any changes (git status --porcelain). If there are changes, we emit an output
+      # `changes=true` so the next step (create-pull-request) runs only when needed.
+      - name: Detect repository changes
+        id: detect_changes
+        run: |
+          echo "==== git status (porcelain) ===="
+          git status --porcelain || true
+          echo "==== git diff --name-only ===="
+          git diff --name-only || true
+
+          # If git status shows anything, we have uncommitted changes to commit.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ----------------- create a PR only when changes were detected (prevents deleting existing PRs) -
       - name: Create Pull Request
-        if: ${{ always() }}
+        if: ${{ steps.detect_changes.outputs.changes == 'true' }}
         id: cpr
         uses: peter-evans/create-pull-request@v7
         with:
+          # Commit message and PR metadata
           commit-message: "adhoc_mentorlink_autoclose: close full mentors for {{date}}"
           title: "adhoc_mentorlink_autoclose: capacity reached – run ${{ github.run_id }}"
           body: |
@@ -121,11 +171,13 @@ jobs:
             Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           add-paths: |
             _data/mentors.yml
+          # Branch naming & cleanup:
           branch: automation/adhoc-mentorlink-autoclose
           branch-suffix: short-commit-hash
           delete-branch: true
           base: main
 
+      # ----------------- print PR link (only if a PR was created) ------------------------------------
       - name: Print PR link (if any)
         if: ${{ steps.cpr.outputs.pull-request-url }}
         run: |
