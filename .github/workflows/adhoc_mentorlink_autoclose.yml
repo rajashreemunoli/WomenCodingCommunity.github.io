@@ -77,6 +77,23 @@ jobs:
         run: |
           echo "$GCP_SA_KEY" > "$RUNNER_TEMP/sa.json"
 
+      - name: Resolve DRY_RUN
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.write }}" = "live" ]; then
+              echo "DRY_RUN=0" >> "$GITHUB_ENV"
+            else
+              echo "DRY_RUN=1" >> "$GITHUB_ENV"
+            fi
+          else
+            if [ "${{ vars.ENABLE_WRITE }}" = "1" ]; then
+              echo "DRY_RUN=0" >> "$GITHUB_ENV"
+            else
+              echo "DRY_RUN=1" >> "$GITHUB_ENV"
+            fi
+          fi
+          echo "Effective DRY_RUN=$(grep '^DRY_RUN=' $GITHUB_ENV | tail -n1 | cut -d= -f2)"
+
       - name: Run automation script
         env:
           GCP_SA_KEY_FILE: ${{ runner.TEMP }}/sa.json
@@ -84,14 +101,7 @@ jobs:
           SHEET_WORKSHEET_TITLE: ${{ vars.SHEET_WORKSHEET_TITLE }}
           MENTORS_YML_PATH: _data/mentors.yml
           TIMEZONE: Europe/London
-          # DRY_RUN resolution:
-          # - Manual: live => 0 (write), dry => 1
-          # - Cron/Dispatch: ENABLE_WRITE=1 => 0 (write), else 1
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch'
-                       ? (inputs.write == 'live' && '0' || '1')
-                       : (vars.ENABLE_WRITE == '1' && '0' || '1') }}
         run: |
-          echo "Effective DRY_RUN=$DRY_RUN"
           python tools/adhoc_mentorlink_autoclose/auto_close_mentors.py
 
       - name: Create Pull Request
