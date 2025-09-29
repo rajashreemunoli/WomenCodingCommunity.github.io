@@ -2,16 +2,22 @@ name: adhoc_mentorlink_autoclose – availability
 
 on:
   repository_dispatch:
-    # Apps Script will send exactly this type
     types: [adhoc-mentorlink-autoclose-submit]
-  workflow_dispatch: {}
-  # Daily run (GitHub cron is UTC; this fires at 07:30 UTC every day)
-  # Your script itself uses Europe/London for date logic.
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Write mode for this manual run"
+        type: choice
+        required: true
+        default: dry
+        options: [dry, live]
+      ref:
+        description: "Git ref to checkout (branch or SHA)"
+        required: false
+        default: feat/adhoc-mentorlink-autoclose
   schedule:
-  # Run on the 1st–10th of each month at 09:00 UTC
-    - cron: "0 9 1-10 * *"
-  # Run on the 1st–10th of each month at 18:00 UTC
-    - cron: "0 18 1-10 * *"
+    - cron: "0 9 1-10 * *"   # days 1–10 at 09:00 UTC
+    - cron: "0 18 1-10 * *"  # days 1–10 at 18:00 UTC
 
 permissions:
   contents: write
@@ -23,16 +29,37 @@ concurrency:
 
 jobs:
   run-adhoc_mentorlink_autoclose:
+    # Manual is always allowed. Cron/dispatch require toggles.
+    if: ${{ github.event_name == 'workflow_dispatch'
+           || (github.event_name == 'schedule' && vars.ENABLE_CRON == '1')
+           || (github.event_name == 'repository_dispatch' && vars.ENABLE_DISPATCH == '1') }}
+
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Resolve ref to checkout
+        id: ref
+        run: |
+          if [ -n "${{ github.event.client_payload.ref }}" ]; then
+            echo "value=${{ github.event.client_payload.ref }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.ref }}" ]; then
+            echo "value=${{ inputs.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=feat/adhoc-mentorlink-autoclose" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repo (feature branch when provided)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.client_payload.ref || 'feat/adhoc-mentorlink-autoclose' }}
-      
-      - name: Debug which ref we checked out
+          ref: ${{ steps.ref.outputs.value }}
+
+      - name: Debug toggles & ref
         run: |
-          echo "Checked out ref: ${{ github.event.client_payload.ref || 'feat/adhoc-mentorlink-autoclose' }}"
+          echo "Event: ${{ github.event_name }}"
+          echo "Checked out ref: ${{ steps.ref.outputs.value }}"
+          echo "ENABLE_CRON=${{ vars.ENABLE_CRON }}"
+          echo "ENABLE_DISPATCH=${{ vars.ENABLE_DISPATCH }}"
+          echo "ENABLE_WRITE=${{ vars.ENABLE_WRITE }}"
+          echo "Manual write input=${{ inputs.write || 'n/a' }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,7 +73,6 @@ jobs:
 
       - name: Write Google service account key
         env:
-          # Your secret name (as you set it)
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY_ADHOCMENTORLINKAUTOCLOSE }}
         run: |
           echo "$GCP_SA_KEY" > "$RUNNER_TEMP/sa.json"
@@ -57,10 +83,15 @@ jobs:
           SHEET_ID: ${{ vars.SHEET_ID }}
           SHEET_WORKSHEET_TITLE: ${{ vars.SHEET_WORKSHEET_TITLE }}
           MENTORS_YML_PATH: _data/mentors.yml
-          # London timezone for month filtering & logging
           TIMEZONE: Europe/London
-          DRY_RUN: "0"
+          # DRY_RUN resolution:
+          # - Manual: live => 0 (write), dry => 1
+          # - Cron/Dispatch: ENABLE_WRITE=1 => 0 (write), else 1
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch'
+                       ? (inputs.write == 'live' && '0' || '1')
+                       : (vars.ENABLE_WRITE == '1' && '0' || '1') }}
         run: |
+          echo "Effective DRY_RUN=$DRY_RUN"
           python tools/adhoc_mentorlink_autoclose/auto_close_mentors.py
 
       - name: Create Pull Request
@@ -68,16 +99,22 @@ jobs:
         id: cpr
         uses: peter-evans/create-pull-request@v7
         with:
-          commit-message: "adhoc_mentorlink_autoclose: disable ad-hoc mentors"
+          commit-message: "adhoc_mentorlink_autoclose: close full mentors for {{date}}"
           title: "adhoc_mentorlink_autoclose: capacity reached – run ${{ github.run_id }}"
           body: |
             Automation: adhoc_mentorlink_autoclose
             Trigger: `${{ github.event_name }}` (type: `${{ github.event.action }}`)
+            Branch ref: `${{ steps.ref.outputs.value }}`
             Timezone: Europe/London
             Sheet ID: `${{ vars.SHEET_ID }}`
+            DRY_RUN: `${{ env.DRY_RUN }}`
             Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           add-paths: |
             _data/mentors.yml
+          branch: automation/adhoc-mentorlink-autoclose
+          branch-suffix: short-commit-hash
+          delete-branch: true
+          base: main
 
       - name: Print PR link (if any)
         if: ${{ steps.cpr.outputs.pull-request-url }}
